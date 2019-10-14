@@ -28,6 +28,86 @@ namespace math = ignition::math;
 namespace math = gazebo::math;
 #endif
 
+#if GAZEBO_MAJOR_VERSION < 9
+typedef gazebo::math::Pose (gazebo::physics::Joint::*ComputeChildLinkPosePtrT)(unsigned int, double);
+typedef bool (gazebo::physics::Joint ::*FindAllConnectedLinksPtrT)(const gazebo::physics::LinkPtr &,
+                                                                   gazebo::physics::Link_V &);
+
+class SetPositionImpl
+{
+  template <ComputeChildLinkPosePtrT ComputeChildLinkPosePtr,
+            FindAllConnectedLinksPtrT FindAllConnectedLinksPtr>
+  friend class SetPositionImplInitializer;
+
+public:
+  static bool Call(const gazebo::physics::JointPtr &_joint, const unsigned int _index, double _position,
+                   const bool _preserveWorldVelocity)
+  {
+    {
+      // limit desired position
+      const double lower_limit(*(_joint->GetLowerLimit(_index)));
+      const double upper_limit(*(_joint->GetUpperLimit(_index)));
+      _position = lower_limit < upper_limit
+                      ? ignition::math::clamp(_position, lower_limit, upper_limit)
+                      : ignition::math::clamp(_position, upper_limit, lower_limit);
+    }
+
+    if (_preserveWorldVelocity)
+    {
+      // child link's current pose & new pose based on position change
+      const gazebo::math::Pose child_pose(_joint->GetChild()->GetWorldPose());
+      const gazebo::math::Pose new_child_pose(
+          ((*_joint).*compute_child_link_pose_ptr_)(_index, _position));
+
+      // populate child links recursively
+      gazebo::physics::Link_V links;
+      ((*_joint).*find_all_connected_links_ptr_)(_joint->GetParent(), links);
+
+      // update pose of each child link on the basis of joint position change
+      for (const gazebo::physics::LinkPtr &link : links)
+      {
+        // NEVER EVER call Link::MoveFrame(child_pose, new_child_pose)
+        // because there is a critical bug which zeros link world velocity
+        link->SetWorldPose((link->GetWorldPose() - child_pose) + new_child_pose);
+      }
+      return true;
+    }
+    else
+    {
+      return _joint->SetPosition(_index, _position);
+    }
+  }
+
+private:
+  static ComputeChildLinkPosePtrT compute_child_link_pose_ptr_;
+  static FindAllConnectedLinksPtrT find_all_connected_links_ptr_;
+};
+ComputeChildLinkPosePtrT SetPositionImpl::compute_child_link_pose_ptr_;
+FindAllConnectedLinksPtrT SetPositionImpl::find_all_connected_links_ptr_;
+
+template <ComputeChildLinkPosePtrT ComputeChildLinkPosePtr,
+          FindAllConnectedLinksPtrT FindAllConnectedLinksPtr>
+class SetPositionImplInitializer
+{
+public:
+  SetPositionImplInitializer()
+  {
+    SetPositionImpl::compute_child_link_pose_ptr_ = ComputeChildLinkPosePtr;
+    SetPositionImpl::find_all_connected_links_ptr_ = FindAllConnectedLinksPtr;
+  }
+
+private:
+  static SetPositionImplInitializer instance_;
+};
+template <ComputeChildLinkPosePtrT ComputeChildLinkPosePtr,
+          FindAllConnectedLinksPtrT FindAllConnectedLinksPtr>
+SetPositionImplInitializer<ComputeChildLinkPosePtr, FindAllConnectedLinksPtr>
+    SetPositionImplInitializer<ComputeChildLinkPosePtr, FindAllConnectedLinksPtr>::instance_;
+
+template class SetPositionImplInitializer<&gazebo::physics::Joint::ComputeChildLinkPose,
+                                          &gazebo::physics::Joint::FindAllConnectedLinks>;
+#endif
+
 namespace gazebo {
 
     MimicJointPlugin::MimicJointPlugin()
@@ -178,11 +258,7 @@ namespace gazebo {
 #if GAZEBO_MAJOR_VERSION >= 9
                 mimic_joint_->SetPosition(0, angle, true);
 #elif GAZEBO_MAJOR_VERSION > 2
-                ROS_WARN_ONCE("The mimic_joint plugin is using the Joint::SetPosition method without preserving the link velocity.");
-                ROS_WARN_ONCE("As a result, gravity will not be simulated correctly for your model.");
-                ROS_WARN_ONCE("Please set gazebo_pid parameters or upgrade to Gazebo 9.");
-                ROS_WARN_ONCE("For details, see https://github.com/ros-simulation/gazebo_ros_pkgs/issues/612");
-                mimic_joint_->SetPosition(0, angle);
+                SetPositionImpl::Call(mimic_joint_, 0, angle, true);
 #else
                 mimic_joint_->SetAngle(0, math::Angle(angle));
 #endif
